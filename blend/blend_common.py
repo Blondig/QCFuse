@@ -147,7 +147,7 @@ class BlendEngineBase:
             model_path=model_path,
             mem_fraction_static=0.6,
             context_length=self.context_length,
-            tp_size=1,
+            tp_size=2,
             disable_cuda_graph=True,
             trust_remote_code=True,
             disable_radix_cache=True,
