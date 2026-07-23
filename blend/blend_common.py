@@ -146,6 +146,7 @@ class BlendEngineBase:
         self.llm = sgl.Engine(
             model_path=model_path,
             mem_fraction_static=0.8,
+            max_total_tokens=16384,
             context_length=self.context_length,
             tp_size=1,
             disable_cuda_graph=True,
