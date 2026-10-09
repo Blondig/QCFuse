@@ -5,14 +5,23 @@ DIGEST_RATIO = 0.1
 DEFAULT_BLEND_RATIO = 0.5
 DEFAULT_CONTEXT_N_SINK = 4
 DEFAULT_CRITICAL_LAYERS = 3
+DEFAULT_PROBE_START = 2
 FUSERAG_DIGEST_RATIO = 0.0
 PROPHETKV_DIGEST_RATIO = 1.0
-BLEND_BASELINES = ("ours", "fuserag", "prophetkv")
+INFLUENCE_METHODS = ("influence", "influence_residual", "influence_mixed")
+INFLUENCE_RESIDUAL_STRENGTH = {
+    "influence": 0.0,
+    "influence_residual": 1.0,
+    "influence_mixed": 0.5,
+}
+QUERY_AWARE_METHODS = ("attn",) + INFLUENCE_METHODS
+BLEND_BASELINES = ("ours", "fuserag", "prophetkv") + INFLUENCE_METHODS
 SUPPORTED_BASELINES = ("fullcomp",) + BLEND_BASELINES
 BASELINE_DIGEST_RATIOS = {
     "ours": DIGEST_RATIO,
     "fuserag": FUSERAG_DIGEST_RATIO,
     "prophetkv": PROPHETKV_DIGEST_RATIO,
+    **{method: DIGEST_RATIO for method in INFLUENCE_METHODS},
 }
 
 # Model-specific Top-10 critical layers. Values are 0-based layer ids and are

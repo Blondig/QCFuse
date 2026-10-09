@@ -33,6 +33,24 @@ class SelectMode(Enum):
     """Selection Strategy for Cache Blending"""
 
     ATTN = "attn"  # Attention based
+    INFLUENCE = "influence"
+    INFLUENCE_RESIDUAL = "influence_residual"
+    INFLUENCE_MIXED = "influence_mixed"
+
+    @property
+    def is_influence(self) -> bool:
+        return self in (
+            SelectMode.INFLUENCE,
+            SelectMode.INFLUENCE_RESIDUAL,
+            SelectMode.INFLUENCE_MIXED,
+        )
+
+    @property
+    def residual_weight(self) -> float:
+        return {
+            SelectMode.INFLUENCE_RESIDUAL: 1.0,
+            SelectMode.INFLUENCE_MIXED: 0.5,
+        }.get(self, 0.0)
 
 
 @dataclass
@@ -435,6 +453,10 @@ class BatchBlendInfo:
     digest_aug_zip_ranges: list = None
     # SSD: layers to keep during DO_BLEND selective clear
     keep_layers_set: set = None
+    # Influence selection uses one shallow layer as a proxy for deeper repairs.
+    influence_weight: float = 0.5
+    influence_metrics: dict = None
+    influence_timing_events: tuple = None
 
     def should_collect_q(self, layer_id: int) -> bool:
         if self.blend_style != BlendStyle.QCOMPUTE:

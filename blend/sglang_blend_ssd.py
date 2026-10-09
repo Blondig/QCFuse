@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,11 +48,21 @@ from qcfuse_config import (
     DEFAULT_CRITICAL_LAYERS,
     DIGEST_INDEX_METHOD,
     DIGEST_RATIO,
+    INFLUENCE_METHODS,
+    INFLUENCE_RESIDUAL_STRENGTH,
+    QUERY_AWARE_METHODS,
     SUPPORTED_BASELINES,
 )
 
 
 DIGEST_ZIP_PROMPT = "\n\nRepeat the previous context exactly."
+
+
+def _ratio_argument(value: str) -> float:
+    ratio = float(value)
+    if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
+        raise argparse.ArgumentTypeError("ratio must be finite and in [0, 1]")
+    return ratio
 
 
 def print_final_metrics(
@@ -69,9 +80,16 @@ def print_final_metrics(
     else:
         score_text = "nan"
         ttft_text = "nan"
+    timing_text = ""
+    for name in ("query_probe_time", "fusion_ttft"):
+        values = result.get(name, [])
+        if values:
+            timing_text += f"\tavg_{name}={sum(values) / len(values):.4f}s"
+    config_text = json.dumps(result.get("config", {}), sort_keys=True)
     print(
         f"{model_name}\t{dataset_name}\t{baseline}\t"
         f"{metric_name}={score_text}\tavg_ttft={ttft_text}"
+        f"{timing_text}\tconfig={config_text}"
     )
 
 
@@ -223,6 +241,7 @@ class SSDPipelineEngine(BlendEngineBase):
         save_query_cache: bool = False,
         query_critical_layers: Optional[List[int]] = None,
     ) -> dict:
+        self._validate_reconstruction(ratio)
         args = {
             "blend_style": blend_style,
             "separator": BLEND_SEP,
@@ -230,7 +249,7 @@ class SSDPipelineEngine(BlendEngineBase):
             "ratio": ratio,
             "method": self.method,
         }
-        if self.method == "attn":
+        if self.method in QUERY_AWARE_METHODS:
             args["attn_start"] = self.attn_start
             args["attn_end"] = self.attn_end
         uses_contextblend = save_query_cache or (
@@ -257,6 +276,19 @@ class SSDPipelineEngine(BlendEngineBase):
         if save_query_cache or blend_style == "KVCOMPUTE":
             args["context_n_sink"] = self.context_n_sink
         return args
+
+    def _validate_reconstruction(self, ratio: float) -> None:
+        if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
+            raise ValueError("ratio must be finite and in [0, 1]")
+        if self.baseline not in BLEND_BASELINES:
+            return
+        num_layers = self._get_model_config()["num_layers"]
+        min_start = 1 if self.method in INFLUENCE_METHODS else 0
+        if not min_start <= self.start < num_layers:
+            raise ValueError(
+                f"{self.baseline} requires probe-start in "
+                f"[{min_start}, {num_layers - 1}], got {self.start}"
+            )
 
     def _build_augmented_prompt(
         self, system_prompt: str, docs: List[str], q_prompt: List[str]
@@ -340,6 +372,9 @@ class SSDPipelineEngine(BlendEngineBase):
         )
         bucket["ttft"].append(result["ttft"])
         bucket["metric"].append(score)
+        for name in ("query_probe_time", "fusion_ttft"):
+            if name in result:
+                bucket[name].append(result[name])
         return score
 
     def warmup_blend(
@@ -353,7 +388,8 @@ class SSDPipelineEngine(BlendEngineBase):
             return
 
         sample_data = self._prepare_samples(dataset, dataset_name)
-        has_qcompute = self.method == "attn"
+        self._validate_reconstruction(ratio)
+        has_qcompute = self.method in QUERY_AWARE_METHODS
         is_fullcomp = self.baseline == "fullcomp"
         start_idx = max(0, len(sample_data) - num_warmup)
 
@@ -439,12 +475,23 @@ class SSDPipelineEngine(BlendEngineBase):
         dataset_name: str,
         ratio: float,
     ) -> dict:
+        self._validate_reconstruction(ratio)
         result_bucket = {
             "ttft": [],
             "metric": [],
+            "query_probe_time": [],
+            "fusion_ttft": [],
+            "config": {
+                "ratio": ratio,
+                "probe_start": self.start,
+                "digest_ratio": self.digest_ratio if self.context_enhance else None,
+                "critical_layers": self.critical_layers,
+                "residual_strength": INFLUENCE_RESIDUAL_STRENGTH.get(self.method),
+                "timing_scope": "request_wall_clock",
+            },
         }
 
-        has_qcompute = self.method == "attn"
+        has_qcompute = self.method in QUERY_AWARE_METHODS
         is_fullcomp = (self.baseline == "fullcomp")
 
         sample_data = self._prepare_samples(dataset, dataset_name)
@@ -478,6 +525,10 @@ class SSDPipelineEngine(BlendEngineBase):
                 **self._blend_args("DO_BLEND_FINISH", ratio),
                 **self._ssd_args(sd),
             )
+            # These are request wall times, including CPU/SSD scheduling; neither
+            # value isolates GPU scoring or attention kernel time.
+            result["query_probe_time"] = q_time
+            result["fusion_ttft"] = result["ttft"]
             result["ttft"] += q_time
 
             self._append_result(result_bucket, result, sd, dataset_name)
@@ -492,7 +543,15 @@ def main():
         "--baseline",
         default="ours",
         choices=SUPPORTED_BASELINES,
-        help="Baseline to run: fullcomp, ours, fuserag, or prophetkv",
+        help="Full prefill, attention selection, or first-order influence variant",
+    )
+    parser.add_argument(
+        "--ratio", type=_ratio_argument, default=DEFAULT_BLEND_RATIO,
+        help="Document reconstruction fraction in [0, 1] (fullcomp always uses 1)",
+    )
+    parser.add_argument(
+        "--probe-start", type=int, default=None,
+        help="First sparse layer, 0-based (default: 2 for influence, 0 otherwise)",
     )
     parser.add_argument("--size", type=int, default=200)
     parser.add_argument(
@@ -515,6 +574,12 @@ def main():
         help="Base SSD directory for KV cache storage",
     )
     args = parser.parse_args()
+    if args.probe_start is not None:
+        if args.baseline not in BLEND_BASELINES:
+            parser.error("--probe-start requires a blend baseline")
+        min_start = 1 if args.baseline in INFLUENCE_METHODS else 0
+        if args.probe_start < min_start:
+            parser.error(f"--probe-start must be at least {min_start} for {args.baseline}")
 
     data_dir = Path(args.data_dir)
     model_arg = Path(args.model)
@@ -540,13 +605,14 @@ def main():
         digest_ratio=DIGEST_RATIO,
         context_cache_source="none",
     ) as engine:
-        engine.warmup(num_warmup=3)
         engine.set_baseline(args.baseline)
+        if args.probe_start is not None:
+            engine.start = args.probe_start
         if args.baseline in BLEND_BASELINES:
             engine.context_enhance = True
             engine.context_cache_source = "query"
             engine.digest_ratio = BASELINE_DIGEST_RATIOS[args.baseline]
-            if args.baseline == "ours":
+            if args.baseline == "ours" or args.baseline in INFLUENCE_METHODS:
                 set_ours_layers(engine, model_name)
             elif args.baseline == "fuserag":
                 set_fuserag_layers(engine, model_name)
@@ -557,11 +623,11 @@ def main():
             engine.context_cache_source = "none"
             engine.critical_layers = None
 
+        ratio = args.ratio if args.baseline in BLEND_BASELINES else 1.0
+        engine._validate_reconstruction(ratio)
+        engine.warmup(num_warmup=3)
         if args.baseline in BLEND_BASELINES:
             engine.phase1_offline(dataset, dataset_name)
-            ratio = DEFAULT_BLEND_RATIO
-        else:
-            ratio = 1.0
 
         engine.warmup_blend(dataset, dataset_name, ratio)
         result = engine.phase2_online(

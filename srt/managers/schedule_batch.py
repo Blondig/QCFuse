@@ -1460,12 +1460,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.blend_info_list.start = reqs[0].start
                 self.blend_info_list.att_params = _build_att_params()
 
+                if self.blend_info_list.select_mode.is_influence:
+                    if len(reqs) != 1 or get_tensor_model_parallel_world_size() != 1:
+                        raise ValueError(
+                            "Influence selection currently requires one request and TP=1"
+                        )
+                    if any(prefix_lens) or extend_lens != seq_lens:
+                        raise ValueError(
+                            "Influence selection requires an unchunked, uncached full prompt"
+                        )
+                    if not 1 <= reqs[0].start < self.model_config.num_hidden_layers:
+                        raise ValueError("Influence probe start must be in [1, num_layers)")
+                    if not 0.0 <= reqs[0].ratio <= 1.0:
+                        raise ValueError("Influence ratio must be finite and in [0, 1]")
+                    text_config = self.model_config.hf_text_config
+                    window = getattr(text_config, "sliding_window", None)
+                    if (
+                        window is not None
+                        and window > 0
+                        and getattr(text_config, "use_sliding_window", True)
+                    ) or getattr(text_config, "attn_logit_softcapping", None):
+                        raise ValueError(
+                            "Influence selection currently supports full causal, uncapped attention"
+                        )
+
                 # Derive keep_layers_set: layers already loaded before DO_BLEND that should
                 # be preserved across ratio rounds (not cleared between DO_BLEND rounds).
-                # Only ATTN mode has preloaded selection layers.
+                # Attention and influence modes share the preloaded critical layers.
                 num_layers = self.model_config.num_hidden_layers
                 select_mode = self.blend_info_list.select_mode
-                if select_mode == SelectMode.ATTN:
+                if select_mode == SelectMode.ATTN or select_mode.is_influence:
                     critical_layers = self.blend_info_list.critical_layers or []
                     attn_start_val = self.blend_info_list.attn_start
                     attn_end_val = self.blend_info_list.attn_end
@@ -1560,6 +1584,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if self.blend_info_list.ratio <= 0 or select_mode == SelectMode.ATTN:
                         prefetch_from = start_layer + 1
                     else:
+                        # Influence scoring compares current and cached K/V at
+                        # the probe layer before choosing the sparse set.
                         prefetch_from = start_layer
                     task_blend = KVSSDManager.start_do_blend_prefetch(prefetch_from, num_layers)
                     task_blend.start()

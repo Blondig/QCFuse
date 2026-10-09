@@ -12,6 +12,8 @@ from sglang.srt.utils.triton_attention_score import warmup_triton_kernels
 
 from qcfuse_config import (
     DEFAULT_CRITICAL_LAYERS,
+    DEFAULT_PROBE_START,
+    INFLUENCE_METHODS,
     MODEL_TOP10_CRITICAL_LAYERS,
     SUPPORTED_BASELINES,
 )
@@ -43,6 +45,10 @@ BLEND_CONFIG = {
     "ours": ("KVCOMPUTE", 0, "attn"),
     "fuserag": ("KVCOMPUTE", 0, "attn"),
     "prophetkv": ("KVCOMPUTE", 0, "attn"),
+    **{
+        method: ("KVCOMPUTE", DEFAULT_PROBE_START, method)
+        for method in INFLUENCE_METHODS
+    },
 }
 
 

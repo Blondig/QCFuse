@@ -1,4 +1,7 @@
+import json
+import logging
 from typing import List, Tuple, Optional
+
 import torch
 import numpy as np
 
@@ -19,6 +22,8 @@ from sglang.srt.utils.kv_ssd_manager import (
     context_pool_lock,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _apply_rotary(rotary_emb, positions, q, k):
     """Apply rotary embedding if available, returning (q, k)."""
@@ -28,6 +33,23 @@ def _apply_rotary(rotary_emb, positions, q, k):
 
 
 class CacheBlender:
+
+    @staticmethod
+    def _log_influence_metrics(blend_info, layer_id):
+        metrics = blend_info.influence_metrics
+        if metrics is None or layer_id != blend_info.att_params.num_layers - 1:
+            return
+        events = blend_info.influence_timing_events
+        if events is not None:
+            begin, selection_begin, selection_end = events
+            # Normally already complete by the last layer. Synchronize only
+            # these events, not the entire device or the SSD prefetch stream.
+            selection_end.synchronize()
+            metrics["dense_prefix_elapsed_ms_excl_first_qkv"] = begin.elapsed_time(
+                selection_begin
+            )
+            metrics["selection_elapsed_ms"] = selection_begin.elapsed_time(selection_end)
+        logger.info("KV influence: %s", json.dumps(metrics, sort_keys=True))
 
     @staticmethod
     def _find_pattern_matches_numpy(
@@ -154,6 +176,19 @@ class CacheBlender:
             return q, k, v
 
         blend_info.rotary_emb = rotary_emb
+
+        if (
+            blend_info.blend_style in (BlendStyle.DO_BLEND, BlendStyle.DO_BLEND_FINISH)
+            and blend_info.select_mode.is_influence
+            and layer_id == 0
+            and q.is_cuda
+        ):
+            # CacheBlender is entered after QKV projection. The first interval
+            # includes dense shallow attention/MLPs and the probe projection,
+            # but excludes layer zero's QKV projection.
+            events = tuple(torch.cuda.Event(enable_timing=True) for _ in range(3))
+            events[0].record(torch.cuda.current_stream(q.device))
+            blend_info.influence_timing_events = events
 
         # Precompute KV cache.
         if blend_info.blend_style == BlendStyle.KVCOMPUTE:
@@ -345,10 +380,17 @@ class CacheBlender:
             elif layer_id == blend_info.start:
                 # Initialize metadata and run selection.
                 blend_info.init_attmeta = True
+                if blend_info.influence_timing_events is not None:
+                    blend_info.influence_timing_events[1].record(
+                        torch.cuda.current_stream(q.device)
+                    )
 
                 if blend_info.ratio <= 0:
                     indices, lens = IndiceSelector.select(blend_info)
-                elif blend_info.select_mode == SelectMode.ATTN:
+                elif (
+                    blend_info.select_mode == SelectMode.ATTN
+                    or blend_info.select_mode.is_influence
+                ):
                     if KVSSDManager.is_online():
                         KVSSDManager.wait_task_b()
                     critical_layers = getattr(blend_info, "critical_layers", None)
@@ -362,8 +404,19 @@ class CacheBlender:
                         old_q = HackBlendKVPool.get_all_q(
                             blend_info.attn_start, blend_info.attn_end
                         )
+                    probe_args = {}
+                    if blend_info.select_mode.is_influence:
+                        if KVSSDManager.is_online():
+                            KVSSDManager.wait_layer_ready(layer_id)
+                        with hack_pool_lock:
+                            cached_k, cached_v = HackBlendKVPool.get_kv(layer_id)
+                        probe_args = dict(
+                            current_q=q, current_k=k, current_v=v,
+                            cached_k=cached_k, cached_v=cached_v,
+                        )
                     indices, lens = IndiceSelector.select(
-                        blend_info, old_k=old_k, old_q=old_q, positions=positions
+                        blend_info, old_k=old_k, old_q=old_q, positions=positions,
+                        **probe_args,
                     )
                 else:
                     raise ValueError(
@@ -376,6 +429,37 @@ class CacheBlender:
                 # Align positions as 1D index for downstream usage
                 blend_info.positions = positions[indices]
                 blend_info.fake_q = torch.zeros_like(q)
+
+                if blend_info.select_mode.is_influence:
+                    # This path is explicitly single-request. Count actual
+                    # document work, including dense shallow layers and the
+                    # full probe-layer K/V projection, separately from query.
+                    locs = blend_info.chunk_loc_list
+                    query_start = int(locs[-2].item())
+                    query_len = int(locs[-1].item()) - query_start
+                    doc_len = max(0, query_start - int(locs[1].item()))
+                    selected = indices.numel() - query_len
+                    layers = blend_info.att_params.num_layers
+                    p = blend_info.start
+                    denominator = layers * doc_len
+                    attention_work = p * doc_len + (layers - p) * selected
+                    kv_work = (p + 1) * doc_len + (layers - p - 1) * selected
+                    blend_info.influence_metrics = {
+                        "method": blend_info.select_mode.value,
+                        "probe_layer": p,
+                        "num_doc_tokens": doc_len,
+                        "selected_doc_tokens": selected,
+                        "ratio": blend_info.ratio,
+                        "influence_weight": blend_info.influence_weight,
+                        "residual_weight": blend_info.select_mode.residual_weight,
+                        "influence_query_scope": "full_suffix",
+                        "doc_attention_mlp_fraction": attention_work / denominator if denominator else 0.0,
+                        "doc_kv_projection_fraction": kv_work / denominator if denominator else 0.0,
+                    }
+                    if blend_info.influence_timing_events is not None:
+                        blend_info.influence_timing_events[2].record(
+                            torch.cuda.current_stream(q.device)
+                        )
 
                 q, k = _apply_rotary(rotary_emb, positions, q, k)
                 q = q[indices]
@@ -408,8 +492,11 @@ class CacheBlender:
                 if rotary_emb is not None:
                     _, old_k = rotary_emb(positions, blend_info.fake_q, old_k)
 
+                CacheBlender._log_influence_metrics(blend_info, layer_id)
                 return q, old_k, old_v
         else:
             q, k = _apply_rotary(rotary_emb, positions, q, k)
 
+        if blend_info.select_mode.is_influence:
+            CacheBlender._log_influence_metrics(blend_info, layer_id)
         return q, k, v

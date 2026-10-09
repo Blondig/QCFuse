@@ -70,14 +70,30 @@ class IndiceSelector:
         old_k: Optional[List[torch.Tensor]] = None,
         old_q: Optional[List[torch.Tensor]] = None,
         positions: Optional[torch.Tensor] = None,
+        *,
+        current_q: Optional[torch.Tensor] = None,
+        current_k: Optional[torch.Tensor] = None,
+        current_v: Optional[torch.Tensor] = None,
+        cached_k: Optional[torch.Tensor] = None,
+        cached_v: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if info.ratio <= 0:
             return IndiceSelector._compute_query_only(info)
-        if info.select_mode != SelectMode.ATTN:
+        if info.select_mode != SelectMode.ATTN and not info.select_mode.is_influence:
             raise ValueError(f"Unsupported select mode for release: {info.select_mode}")
         if old_k is None or old_q is None:
             raise ValueError("ATTN mode requires old_k and old_q")
-        return IndiceSelector._compute_layer_fusion(info, old_k, old_q, positions)
+        probe = None
+        if info.select_mode.is_influence:
+            required = (current_q, current_k, current_v, cached_k, cached_v, positions)
+            if any(x is None for x in required):
+                raise ValueError(
+                    "Influence selection requires current Q/K/V, cached K/V and positions"
+                )
+            if not 1 <= info.start < info.att_params.num_layers:
+                raise ValueError("Influence selection needs at least one complete shallow layer")
+            probe = (current_q, current_k, current_v, cached_k, cached_v)
+        return IndiceSelector._compute_layer_fusion(info, old_k, old_q, positions, probe)
 
     @staticmethod
     def _compute_query_only(info: BatchBlendInfo) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -108,10 +124,88 @@ class IndiceSelector:
         is_query: bool,
     ) -> torch.Tensor:
         pos = token_positions.repeat(num_layers)
-        flat = tensor.reshape(-1, num_heads * head_dim)
-        q_rot, k_rot = rotary_emb(pos, flat, flat)
+        # CUDA RoPE can mutate both arguments. Never alias them or mutate the
+        # query/cache tensors that later attention or ratio rounds will reuse.
+        flat = tensor.reshape(-1, num_heads * head_dim).clone()
+        dummy = torch.empty_like(flat)
+        if is_query:
+            q_rot, k_rot = rotary_emb(pos, flat, dummy)
+        else:
+            q_rot, k_rot = rotary_emb(pos, dummy, flat)
         rotated = q_rot if is_query else k_rot
         return rotated.reshape(num_layers, -1, num_heads, head_dim)
+
+    @staticmethod
+    def _compute_influence(info, region, positions, probe):
+        """Measure shallow-layer sensitivity using a fixed, current query.
+
+        The probe layer's K/V is already dense. These scores predict the value
+        of keeping a token active in subsequent layers, not its repair here.
+        """
+        from sglang.srt.utils.attention_influence import compute_attention_influence
+
+        current_q, current_k, current_v, cached_k, cached_v = probe
+        params = info.att_params
+        r = region
+        # Use the actual full suffix (question and its template) in this forward.
+        # Separately tokenized QCOMPUTE offsets need not align with the suffix's
+        # BPE boundaries, so they must not index the dense probe query.
+        q_start, q_end = r.quest_start, r.quest_end
+        q_len = q_end - q_start
+        if q_len <= 0:
+            raise ValueError("Influence selection requires a nonempty query suffix")
+        if any(t.shape[0] < q_end for t in (current_q, current_k, current_v)) or any(
+            t.shape[0] < r.quest_start for t in (cached_k, cached_v)
+        ):
+            raise ValueError("Influence probe/cache does not cover the full prompt")
+
+        q = current_q[q_start:q_end].reshape(
+            1, q_len, params.num_heads, params.head_dim
+        )
+        # Full denominator: system + every document + causally visible query
+        # tokens. Query K/V comes from this forward, not the offline suffix.
+        k = torch.cat(
+            (cached_k[r.req_start:r.quest_start], current_k[r.quest_start:q_end])
+        )
+        v = torch.cat(
+            (cached_v[r.req_start:r.quest_start], current_v[r.quest_start:q_end])
+        )
+        k = k.reshape(1, -1, params.num_kv_heads, params.head_dim)
+        new_k = current_k[r.rag_start:r.quest_start].reshape(
+            1, r.rag_len, params.num_kv_heads, params.head_dim
+        )
+        rotary_emb = getattr(info, "rotary_emb", None)
+        if rotary_emb is not None:
+            q = IndiceSelector._rotate_stacked(
+                rotary_emb, positions[q_start:q_end], q, 1,
+                params.num_heads, params.head_dim, is_query=True,
+            )
+            k = IndiceSelector._rotate_stacked(
+                rotary_emb, positions[r.req_start:q_end], k, 1,
+                params.num_kv_heads, params.head_dim, is_query=False,
+            )
+            new_k = IndiceSelector._rotate_stacked(
+                rotary_emb, positions[r.rag_start:r.quest_start], new_k, 1,
+                params.num_kv_heads, params.head_dim, is_query=False,
+            )
+        target_start = r.rag_start - r.req_start
+        # Subtract in FP32 after mapping both keys to the same request position.
+        delta_k = (
+            new_k[0].float()
+            - k[0, target_start:target_start + r.rag_len].float()
+        )
+        delta_v = (
+            current_v[r.rag_start:r.quest_start].float()
+            - cached_v[r.rag_start:r.quest_start].float()
+        ).reshape(r.rag_len, params.num_kv_heads, params.head_dim)
+        return compute_attention_influence(
+            q[0], k[0], v.reshape(-1, params.num_kv_heads, params.head_dim),
+            delta_k, delta_v,
+            target_start=target_start,
+            q_positions=positions[q_start:q_end],
+            key_positions=positions[r.req_start:q_end],
+            residual_weight=info.select_mode.residual_weight,
+        )
 
     @staticmethod
     def _compute_layer_fusion(
@@ -119,6 +213,7 @@ class IndiceSelector:
         old_k: List[torch.Tensor],
         old_q: List[torch.Tensor],
         positions: Optional[torch.Tensor] = None,
+        probe=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         params = info.att_params
         chunk_loc = info.chunk_loc_list
@@ -212,6 +307,16 @@ class IndiceSelector:
                     target_len=r.rag_len,
                     q_start=full_q_start,
                 )
+
+                if probe is not None:
+                    from sglang.srt.utils.attention_influence import fuse_scores
+
+                    influence = IndiceSelector._compute_influence(
+                        info, r, positions, probe
+                    )
+                    importance = fuse_scores(
+                        importance, influence, influence_weight=info.influence_weight
+                    )
 
                 k_budget = _compute_budget(r.rag_len, ratio)
                 if k_budget > 0:
